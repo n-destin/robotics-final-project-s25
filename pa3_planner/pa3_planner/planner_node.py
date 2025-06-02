@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Point
+from geometry_msgs.msg import Twist, Point, PoseStamped
 import math
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -18,6 +17,9 @@ class PlannerNode(Node):
         
         # Create publisher for robot movement
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # Create publisher for path visualization
+        self.path_pub = self.create_publisher(Path, '/planned_path', 10)
         
         # Create subscribers
         self.odom_sub = self.create_subscription(
@@ -35,9 +37,10 @@ class PlannerNode(Node):
         # Create timer for movement updates
         self.timer = self.create_timer(0.1, self.movement_callback)  # 10Hz
         
+        # Create timer for path publishing
+        self.path_timer = self.create_timer(1.0, self.publish_path)  # 1Hz
+        
         # Movement parameters
-        self.linear_speed = 0.2  # m/s
-        self.angular_speed = 0.5  # rad/s
         self.current_linear_speed = 0.0
         self.current_angular_speed = 0.0
         
@@ -60,8 +63,18 @@ class PlannerNode(Node):
         self.cell_size = 1.0  # Size of each cell in meters
         self.current_path = None
         self.current_path_index = 0
-        self.grid_width = 10  # Number of cells in width
-        self.grid_height = 10  # Number of cells in height
+        
+        # Get parameters from launch file or use defaults
+        self.declare_parameter('grid_width', 3)
+        self.declare_parameter('grid_height', 3)
+        self.declare_parameter('linear_speed', 0.2)
+        self.declare_parameter('angular_speed', 0.5)
+        
+        self.grid_width = self.get_parameter('grid_width').value
+        self.grid_height = self.get_parameter('grid_height').value
+        self.linear_speed = self.get_parameter('linear_speed').value
+        self.angular_speed = self.get_parameter('angular_speed').value
+        
         self.obstacles = []  # List of obstacle coordinates
         
         # Initialize TF buffer and listener
@@ -73,10 +86,13 @@ class PlannerNode(Node):
         
         self.get_logger().info('Planner node initialized')
 
-    # Create a grid graph representation of the space/map
     def create_grid_graph(self, width, height, obstacles=None):
+        """Create a grid graph representation of the space"""
         if obstacles is None:
             obstacles = []
+            
+        # Clear existing graph
+        self.graph.clear()
             
         # Create nodes for each cell
         for x in range(width):
@@ -84,86 +100,253 @@ class PlannerNode(Node):
                 if (x, y) not in obstacles:
                     self.graph.add_node((x, y))
         
+        # If no nodes were added, return
+        if not self.graph.nodes():
+            self.get_logger().warn('No valid nodes in graph')
+            return
+            
         # Create edges between adjacent cells
-        # in order to give the robot the ability to traverse cells
         for x in range(width):
             for y in range(height):
                 if (x, y) in obstacles:
                     continue
                     
-                # Check right neighbor if not an obstacle
+                # Check right neighbor
                 if x + 1 < width and (x + 1, y) not in obstacles:
                     self.graph.add_edge((x, y), (x + 1, y), weight=1)
                 
-                # Check top neighbor if not an obstacle
+                # Check top neighbor
                 if y + 1 < height and (x, y + 1) not in obstacles:
                     self.graph.add_edge((x, y), (x, y + 1), weight=1)
+                
+                # Check diagonal neighbors
+                if x + 1 < width and y + 1 < height and (x + 1, y + 1) not in obstacles:
+                    self.graph.add_edge((x, y), (x + 1, y + 1), weight=1.414)  # sqrt(2)
+                if x + 1 < width and y - 1 >= 0 and (x + 1, y - 1) not in obstacles:
+                    self.graph.add_edge((x, y), (x + 1, y - 1), weight=1.414)  # sqrt(2)
+        
+        # If no edges were added, add a self-loop to make the graph Eulerian
+        if not self.graph.edges():
+            if len(self.graph.nodes()) == 1:
+                node = list(self.graph.nodes())[0]
+                self.graph.add_edge(node, node, weight=0)
+                self.get_logger().info('Added self-loop to single node')
+            else:
+                # Connect all nodes in a cycle
+                nodes = list(self.graph.nodes())
+                for i in range(len(nodes)):
+                    v1 = nodes[i]
+                    v2 = nodes[(i + 1) % len(nodes)]
+                    weight = math.sqrt((v1[0] - v2[0])**2 + (v1[1] - v2[1])**2)
+                    self.graph.add_edge(v1, v2, weight=weight)
+                self.get_logger().info('Connected nodes in a cycle')
+            return
+            
+        # Ensure the graph is connected
+        if not nx.is_connected(self.graph):
+            # Find connected components
+            components = list(nx.connected_components(self.graph))
+            # Connect components with minimum weight edges
+            for i in range(len(components) - 1):
+                comp1 = components[i]
+                comp2 = components[i + 1]
+                min_dist = float('inf')
+                min_edge = None
+                for v1 in comp1:
+                    for v2 in comp2:
+                        dist = math.sqrt((v1[0] - v2[0])**2 + (v1[1] - v2[1])**2)
+                        if dist < min_dist:
+                            min_dist = dist
+                            min_edge = (v1, v2)
+                if min_edge:
+                    self.graph.add_edge(min_edge[0], min_edge[1], weight=min_dist)
+        
+        self.get_logger().info(f'Created graph with {len(self.graph.nodes())} nodes and {len(self.graph.edges())} edges')
     
-    # Find all vertices with odd degree in the graph
     def find_odd_degree_vertices(self):
-        return [v for v in self.graph.nodes() if self.graph.degree(v) % 2 != 0]
+        """Find all vertices with odd degree in the graph"""
+        odd_vertices = [v for v in self.graph.nodes() if self.graph.degree(v) % 2 != 0]
+        self.get_logger().info(f'Found {len(odd_vertices)} odd degree vertices')
+        return odd_vertices
     
-    # Find minimum weight perfect matching for odd degree vertices
     def find_minimum_weight_matching(self, odd_vertices):
+        """Find minimum weight perfect matching for odd degree vertices"""
+        if not odd_vertices:
+            return set()
+            
         matching_graph = nx.Graph()
         
         # Add edges between all pairs of odd vertices
         for i in range(len(odd_vertices)):
             for j in range(i + 1, len(odd_vertices)):
                 v1, v2 = odd_vertices[i], odd_vertices[j]
-                weight = abs(v1[0] - v2[0]) + abs(v1[1] - v2[1])
+                # Use Euclidean distance as weight
+                weight = math.sqrt((v1[0] - v2[0])**2 + (v1[1] - v2[1])**2)
                 matching_graph.add_edge(v1, v2, weight=weight)
         
-        matching = nx.max_weight_matching(matching_graph, maxcardinality=True)
-        return matching
-    
-    # Find Eulerian circuit in the graph
-    def find_eulerian_circuit(self):
+        # Find minimum weight matching
         try:
+            matching = nx.min_weight_matching(matching_graph)
+            self.get_logger().info(f'Found {len(matching)} matching pairs')
+            return matching
+        except nx.NetworkXError as e:
+            self.get_logger().error(f'Error finding matching: {str(e)}')
+            return set()
+    
+    def find_eulerian_circuit(self):
+        """Find Eulerian circuit in the graph"""
+        if not nx.is_connected(self.graph):
+            self.get_logger().warn('Graph is not connected')
+            return None
+            
+        try:
+            # Check if graph is Eulerian
+            if not nx.is_eulerian(self.graph):
+                self.get_logger().warn('Graph is not Eulerian')
+                return None
+                
+            # Find Eulerian circuit
             circuit = list(nx.eulerian_circuit(self.graph))
+            self.get_logger().info(f'Found Eulerian circuit with {len(circuit)} edges')
             return circuit
-        except nx.NetworkXError:
+        except nx.NetworkXError as e:
+            self.get_logger().error(f'Error finding Eulerian circuit: {str(e)}')
             return None
     
     def chinese_postman(self):
-        # Algorthim Implementation from: https://webspace.maths.qmul.ac.uk/b.jackson/MAS210/ch8.pdf
+        """Solve the Chinese Postman Problem"""
+        self.get_logger().info('Starting Chinese Postman algorithm')
+        
+        # Check if graph is empty
+        if not self.graph.nodes():
+            self.get_logger().warn('Graph is empty')
+            return None
+            
+        # Check if graph is connected
+        if not nx.is_connected(self.graph):
+            self.get_logger().warn('Graph is not connected')
+            return None
+            
+        # Find odd degree vertices
         odd_vertices = self.find_odd_degree_vertices()
         
+        # If no odd vertices, graph is already Eulerian
         if not odd_vertices:
+            self.get_logger().info('No odd vertices, graph is already Eulerian')
             circuit = self.find_eulerian_circuit()
             if circuit:
                 return [edge[0] for edge in circuit] + [circuit[-1][1]]
+            return None
         
+        # Create a MultiGraph copy for modification (allows duplicate edges)
+        working_graph = nx.MultiGraph(self.graph)
+        self.get_logger().info(f'Created MultiGraph with {len(working_graph.nodes())} nodes and {len(working_graph.edges())} edges')
+        
+        # Find minimum weight matching
         matching = self.find_minimum_weight_matching(odd_vertices)
+        self.get_logger().info(f'Processing {len(matching)} matching pairs')
         
+        # Add matching edges to the working graph using shortest paths
         for v1, v2 in matching:
-            path = nx.shortest_path(self.graph, v1, v2)
-            for i in range(len(path) - 1):
-                self.graph.add_edge(path[i], path[i + 1])
+            try:
+                # Find shortest path between matched vertices
+                path = nx.shortest_path(self.graph, v1, v2, weight='weight')
+                self.get_logger().info(f'Adding path from {v1} to {v2} with {len(path)-1} edges')
+                self.get_logger().info(f'Path: {path}')
+                
+                # Check degrees before adding
+                deg_v1_before = working_graph.degree(v1)
+                deg_v2_before = working_graph.degree(v2)
+                
+                # Add edges along the path (duplicate existing edges in MultiGraph)
+                for i in range(len(path) - 1):
+                    # Get weight from original graph or calculate
+                    if self.graph.has_edge(path[i], path[i + 1]):
+                        weight = self.graph[path[i]][path[i + 1]]['weight']
+                    else:
+                        # Calculate weight for new edge
+                        weight = math.sqrt((path[i][0] - path[i + 1][0])**2 + 
+                                         (path[i][1] - path[i + 1][1])**2)
+                    # Add edge to MultiGraph (will create duplicate)
+                    working_graph.add_edge(path[i], path[i + 1], weight=weight)
+                
+                # Check degrees after adding
+                deg_v1_after = working_graph.degree(v1)
+                deg_v2_after = working_graph.degree(v2)
+                self.get_logger().info(f'Degrees: {v1}: {deg_v1_before}->{deg_v1_after}, {v2}: {deg_v2_before}->{deg_v2_after}')
+                
+            except nx.NetworkXNoPath:
+                self.get_logger().warn(f'No path found between {v1} and {v2}')
+                continue
         
-        circuit = self.find_eulerian_circuit()
-        if circuit:
+        self.get_logger().info('Added matching paths to working graph')
+        
+        # Check vertex degrees after matching
+        remaining_odd = [v for v in working_graph.nodes() if working_graph.degree(v) % 2 != 0]
+        if remaining_odd:
+            self.get_logger().warn(f'Still have {len(remaining_odd)} odd vertices after matching: {remaining_odd}')
+            for v in remaining_odd:
+                self.get_logger().info(f'Vertex {v} has degree {working_graph.degree(v)}')
+            return None
+        else:
+            self.get_logger().info('All vertices now have even degree!')
+        
+        self.get_logger().info('All vertices now have even degree - finding Eulerian circuit')
+        
+        # Find Eulerian circuit in the modified graph
+        try:
+            circuit = list(nx.eulerian_circuit(working_graph))
+            if not circuit:
+                self.get_logger().warn('Empty circuit found')
+                return None
+            self.get_logger().info(f'Found Eulerian circuit with {len(circuit)} edges')
             return [edge[0] for edge in circuit] + [circuit[-1][1]]
-        
-        return None
+        except nx.NetworkXError as e:
+            self.get_logger().error(f'Error finding Eulerian circuit: {str(e)}')
+            return None
     
     def get_path_coordinates(self, path):
-        # Convert grid coordinates to real-world coordinates
+        """Convert grid coordinates to real-world coordinates"""
         return [(x * self.cell_size, y * self.cell_size) for x, y in path]
 
     def initialize_path_planning(self):
-        # Initialize the path planning with the Chinese Postman algorithm
+        """Initialize the path planning with the Chinese Postman algorithm"""
         # Create grid graph
         self.create_grid_graph(self.grid_width, self.grid_height, self.obstacles)
         
+        # Check if all cells are obstacles
+        if len(self.obstacles) == self.grid_width * self.grid_height:
+            self.get_logger().warn('All cells are obstacles')
+            self.current_path = None
+            return
+            
+        # Check if graph is empty
+        if not self.graph.nodes():
+            self.get_logger().warn('Graph is empty after obstacle removal')
+            self.current_path = None
+            return
+            
+        # Check if graph is connected
+        if not nx.is_connected(self.graph):
+            self.get_logger().warn('Graph is not connected')
+            self.current_path = None
+            return
+            
+        # Check if graph has edges
+        if not self.graph.edges():
+            self.get_logger().warn('Graph has no edges')
+            self.current_path = None
+            return
+            
         # Solve for optimal path
         path = self.chinese_postman()
-        if path:
+        if path and len(path) > 1:  # Ensure we have at least 2 points for a valid path
             self.current_path = self.get_path_coordinates(path)
             self.current_path_index = 0
-            self.get_logger().info('Path planning initialized successfully')
+            self.get_logger().info(f'Path planning initialized successfully with {len(self.current_path)} points')
         else:
             self.get_logger().error('Failed to find valid path')
+            self.current_path = None
 
     def get_angle_to_target(self, target_x, target_y):
         # Calculate the angle to the target point
@@ -289,6 +472,29 @@ class PlannerNode(Node):
         
         # Publish the movement command
         self.cmd_vel_pub.publish(twist)
+
+    def publish_path(self):
+        """Publish the planned path for visualization"""
+        if not self.current_path:
+            self.get_logger().warn('No current path to publish - path is None')
+            return
+            
+        self.get_logger().info(f'Publishing path with {len(self.current_path)} points')
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'odom'
+        
+        for i, (x, y) in enumerate(self.current_path):
+            pose_stamped = PoseStamped()
+            pose_stamped.header.stamp = self.get_clock().now().to_msg()
+            pose_stamped.header.frame_id = 'odom'
+            pose_stamped.pose.position.x = x
+            pose_stamped.pose.position.y = y
+            pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.w = 1.0
+            path_msg.poses.append(pose_stamped)
+        
+        self.path_pub.publish(path_msg)
 
 def main(args=None):
     rclpy.init(args=args)
